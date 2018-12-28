@@ -1,0 +1,728 @@
+---
+title: "Final Project - Instacart Basket Analysis EDA"
+author: Xinyi Zhang, Yawen Zheng, Royce Chan 
+date: October 19, 2018
+output:
+  prettydoc::html_pretty:
+    toc: true
+    smooth_scroll: true
+    collapsed: false
+    highlight: tango
+    theme: cayman
+---
+
+# Introduction
+***
+In 2017, Instacart provided anonymized data on Kaggle describing customers' orders over time. 
+
+The dataset contains a sample of over 3 million grocery orders from more than 200,000 Instacart users. For each user, Instacart provided between 4 and 100 of their orders, with the sequence of products purchased in each order. It also provided the week and hour of day the order was placed, and a relative measure of time between orders. 
+
+**Our objective is to predict which products will be in a user's next order.** 
+
+# Load libraries
+***
+```{r warning = FALSE, message = FALSE}
+library(tidyverse)
+library(DataExplorer)
+library(R.utils)
+library(gridExtra)
+library(ggridges)
+library(treemap)
+library(knitr)
+library(plotly)
+library(scales)
+library(gridExtra)
+library(RColorBrewer)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(magrittr)
+```
+
+# Load data
+***
+```{r}
+aisles <- read.csv("data/aisles.csv")
+departments <- read.csv("data/departments.csv")
+order_products_prior <- read.csv("data/order_products__prior.csv")
+order_products_train <- read.csv("data/order_products__train.csv")
+orders <- read.csv("data/orders.csv")
+products <- read.csv("data/products.csv")
+```
+
+
+# Understanding the data
+***
+
+The dataset consists of information about 3.4 million grocery orders, distributed across 6 csv files. In this section, we focus on getting a good preliminary understanding of our data before going into deeper analysis.
+
+```{r}
+data_list <- list(products, aisles, departments, order_products_prior, order_products_train, orders)
+plot_str(data_list)
+```
+
+1. **Products**: Contains the names of the products with their corresponding product_id. Aisle and department IDs are also included.
+
+2. **Aisles**: Contains the id and the names of the different aisles
+
+3. **Departments**: Contains the id and the names of the different departments.
+
+4. **Order_products_prior**: Contains product information (product_id) and user order information such as add to cart order, and whether the product was reordered.
+
+5. **Order_products_train**: Structure is similar to **Order_products_prior**, but information only about each order that is used for training.
+
+6. **Orders**: List of all orders in the dataset, with 1 row per order. Each order is classified as prior, train, test. For example, user 1 has 11 orders - 10 classified as prior, and the last 1 as train. No product information is included. 
+
+## Understanding **Orders** table
+***
+
+```{r}
+plot_missing(orders)
+```
+
+* 6% of the days_since_prior_order are missing. This is due to customers not having a prior order before their first order. Hence, we will change the NAs to 0 in when we reshape the data.
+
+```{r}
+kable(count(orders,eval_set)) %>% 
+   kable_styling(bootstrap_options = c("striped", "hover", full_width = F, position = "left"))
+```
+
+* There is a total of 3.2 million distinct orders which captured as "prior", which can be matched to the data in **order_products_prior**. 
+
+* 131,209 orders captured as "train" can be matched to the data in **order_products_train**. 
+
+* Our task is to predict the products found in the 75,000 orders captured as "test".
+
+* **As the train set only includes the last order number of a small amount of customers, we will use the data captured as "prior" to perform our EDA.** 
+
+## Reconfigure tables
+***
+
+### Product table 
+***
+
+* To keep our data frame concise, we will remove aisle and department IDs.
+
+```{r }
+# set aisle and department names as factors 
+aisles %>% mutate(aisle = as.factor(aisle))
+departments %>%  mutate(department = as.factor(department))
+
+products_detail <- products %>% 
+  inner_join(aisles, by = "aisle_id") %>% 
+  inner_join(departments, by = "department_id") %>% 
+  
+  # remove aisle and department ID
+  select(-aisle_id, -department_id) 
+
+head(products_detail,10)
+```
+
+* For the purpose of our EDA, we create a similar table that only captures "prior" orders.
+
+```{r}
+orders_prior_detail_eda <- products_detail %>% 
+  inner_join(order_products_prior, by = "product_id") %>% 
+  inner_join(orders, by = "order_id") %>% 
+  filter(eval_set == "prior")
+
+head(orders_prior_detail_eda,10)
+```
+
+# Exploratory data analysis
+***
+
+In this section, we will attempt to derive insights about the customer orders on two levels: 
+
+* **Product-level**: Characteristics of a product
+
+* **User-level**: Characteristics of a user 
+
+## Product-level insights
+***
+
+### How many unique products are offered in each aisle / department?
+***
+
+```{r}
+product_portfolio <- products_detail %>% 
+  na.omit() %>% 
+  group_by(department, aisle) %>% 
+  summarise(n=n())
+
+treemap(product_portfolio,
+        index=c("department","aisle"),
+        vSize="n",
+        title="No. of unique products in each aisle/department",
+        palette="Set3",
+        border.col="#FFFFFF")
+```
+
+* We see a fairly well-represented number of products in each aisle and department, with personal care and snacks departments having the most unique products.
+
+### Which are the more popular aisles and departments?
+***
+
+```{r}
+products_sold <- orders_prior_detail_eda %>%
+      na.omit() %>% 
+      group_by(department, aisle) %>% 
+      summarize(n=n()) %>% 
+
+treemap(products_sold,
+        index=c("department","aisle"),
+        vSize="n",
+        title="Most popular aisles/departments",
+        palette="Set3",
+        border.col="#FFFFFF")
+```
+
+* Despite having a smaller variety, produce and dairy/eggs departments represent the highest quantity sold. This is expected as the goods in these departments are largely homogenous - Instacart will not stock too many brands and unique products. 
+
+* At the same time. this is representative of Instacart's competitive advantage - groceries that generate consistent recurring spend. 
+
+### Which are our bestsellers?
+
+```{r}
+my_palette <- c('orange', 'orangered2', 'darkgrey', "lightcoral")
+my_theme <- theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+top_10_products <- orders_prior_detail_eda %>% 
+  group_by(product_name,aisle) %>% 
+  summarize(count=n()) %>% 
+  arrange(desc(count)) %>% 
+  head(n=10)
+
+
+  ggplot(top_10_products,aes(x = reorder(product_name,count),y=count, fill=aisle)) + 
+    theme_minimal() +
+    geom_bar(stat = "identity",color = FALSE)+
+    xlab("Product")+ ylab("Count")+
+    ggtitle("Bestsellers of Products by Aisle")+
+    scale_fill_manual(values = my_palette) +
+    geom_text(aes(label= count), hjust=1.1, colour='white', size=3.5) +
+    coord_flip() +
+    theme(panel.grid.major = element_blank(),
+          legend.justification=c(1,0), 
+          legend.position=c(1,0),
+          legend.title=element_blank()) +
+    scale_y_continuous(labels = scales::comma) 
+```
+
+* Out of the top 10 bestsellers, 8 are from the fresh fruits aisle. 
+
+* Bananas and avocados have two entries each in the top 10 bestseller list (organic and non-organic).
+
+### Which departments do customers reorder from more frequently?
+***
+
+*First, we create the normalised quantity to facilitate comparison between deparments:* 
+```{r}
+dpt_reorder <- orders_prior_detail_eda %>%  
+  group_by(department,days_since_prior_order) %>%
+  
+  # remove missing department
+  filter(!department == "missing") %>% 
+  
+  # remove 30 since it will distort normalisation - all reorders above 30 days are also captured in this column
+  filter(!days_since_prior_order == 30) %>% 
+  
+  # quantity reordered per department and days since prior order
+  summarise(quantity = n()) %>% 
+  
+  # create normalised feature (q-mean(q) / max(q)-min(q)) per dept to facilitate comparison between departments
+  mutate(nor1 = quantity-mean(quantity), nor2 = max(quantity)-min(quantity), nor3= nor1 / nor2)
+
+kable(head(dpt_reorder,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+```{r}
+# highlight babies and alcohol department
+dpt_reorder_filtered <- dpt_reorder %>% 
+  filter(department=="babies" | department=="alcohol")
+
+dpt_reorder_freq <- ggplot()+
+  geom_line(data=dpt_reorder, aes(days_since_prior_order, nor3, group=department)) +
+  geom_line(data=dpt_reorder_filtered, aes(days_since_prior_order, nor3, colour=department), size = 1) +
+  theme_minimal() +
+  xlab("Days since prior order")+ ylab("Normalised quantity")+ ggtitle("Reorder frequency by product department")+
+  scale_color_manual(values = my_palette) +
+  my_theme+
+    theme(panel.grid.major = element_blank(),
+          legend.justification=c(1,0), 
+          legend.position=c(1,0.5)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(15)) 
+
+ dpt_reorder_freq
+```
+
+* In general, we see peaks in reorders every 7 days i.e. customers tend to order in weekly, bi-weekly or tri-weekly intervals. 
+
+* Most customers order once every 7 days.
+
+* Interestingly, alcohol department has the highest normalized quantity of purchases that are reordered within the 0-3 day range, while Babies department has the highest within the 4-6 day range. 
+
+* However, after the first 7 days, alcohol has the lowest normalized quantity of purchases amongst all departments. 
+
+### Which bestsellers do customers reorder more frequently?
+***
+
+```{r}
+prod_reorder <- orders_prior_detail_eda %>%  
+  group_by(product_name,days_since_prior_order) %>%
+  
+  # filter for only top 10 products
+  filter(product_name %in% top_10_products$product_name) %>% 
+ 
+  # remove 30 since it will distort normalisation - all reorders above 30 days are also captured in this column
+  filter(!days_since_prior_order == 30) %>%
+
+  # quantity reordered per product and days since prior order
+  summarise(quantity = n()) %>%
+
+  # create normalised feature (q-mean(q) / max(q)-min(q)) per prod to facilitate comparison between products
+  mutate(nor1 = quantity-mean(quantity), nor2 = max(quantity)-min(quantity), nor3= nor1 / nor2)
+
+kable(head(prod_reorder,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+```{r}
+# highlight products where normalised quantity is anomalous
+prod_reorder_filtered <- prod_reorder %>% 
+  filter(product_name=="Organic Strawberries" | product_name=="Bag of Organic Bananas" | product_name=="Organic Whole Milk" | product_name=="Organic Hass Avocado")
+
+prod_reorder_freq <- ggplot()+
+  geom_line(data=prod_reorder, aes(days_since_prior_order, nor3, group=product_name)) +
+  geom_line(data=prod_reorder_filtered, aes(days_since_prior_order, nor3, colour=product_name), size = 1) +
+  theme_minimal() +
+  xlab("Days since prior order")+ ylab("Normalised quantity")+ ggtitle("Reorder frequency by bestsellers")+ labs(colour = "Product") +
+  scale_color_manual(values = my_palette) +
+  my_theme+
+    theme(panel.grid.major = element_blank(),
+          legend.justification=c(1,0), 
+          legend.position=c(1,0.5)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(15)) 
+
+prod_reorder_freq
+```
+
+* Similar to department reorder analysis above, we see peaks in reorders every 7 days i.e. customers tend to order in weekly, bi-weekly or tri-weekly intervals. 
+
+* Interestingly, even though there were only 6 organic products out of the top 10 bestsellers, all 4 bestsellers with the highest normalized quantity of purchases reordered within the 0-6 day range are **organic products**. 
+
+* *This prompts further analysis - do organic products get reordered more often than non-organic products?*
+
+### Do organic products get reordered more frequently than non-organic products?
+***
+
+```{r message=FALSE, warning=FALSE}
+# add new column in products to classify whether product is organic
+products_organic <- products %>% 
+    mutate(organic=ifelse(str_detect(str_to_lower(products$product_name),'organic'),"organic","non-organic"), organic= as.factor(organic))
+
+# joining tables 
+order_products_organic <- products_organic %>% 
+  inner_join(order_products_prior) %>% 
+  inner_join(orders)
+
+# generate data frame for summarising organic vs days since prior order  
+organic_reorder <- order_products_organic %>%  
+    group_by(organic,days_since_prior_order) %>%
+    
+    # remove 30 since it will distort normalisation - all reorders above 30 days are also captured in this column
+    filter(!days_since_prior_order == 30) %>%
+  
+    # quantity reordered per product and days since prior order
+    summarise(quantity = n()) %>%
+  
+    # create normalised feature (q-mean(q) / max(q)-min(q)) per prod to facilitate comparison between products
+    mutate(nor1 = quantity-mean(quantity), nor2 = max(quantity)-min(quantity), nor3= nor1 / nor2)
+
+```
+
+```{r}
+organic_reorder_freq <- ggplot()+
+  geom_line(data=organic_reorder, aes(days_since_prior_order, nor3, colour=organic), size =1) +
+  theme_minimal() +
+  xlab("Days since prior order")+ ylab("Normalised quantity")+ ggtitle("Organic product reorder frequency") +
+    theme(panel.grid.major = element_blank(),
+          legend.justification=c(1,0), 
+          legend.position=c(1,0.5),
+          legend.title=element_blank()) +
+  scale_color_manual(values = my_palette)+
+    scale_x_continuous(breaks = scales::pretty_breaks(15)) 
+
+organic_reorder_freq
+```
+
+* The trend we found in our earlier bestseller reorder frequency analysis can be extended to all organic products. Organic products display higher normalized quantity of purchases reordered within the 3-6 day range as compared to inorganic products.    
+
+* Customers who order organic products tend to place their orders more frequently than customers who do not
+
+### Which products have the highest likelihood of being reordered?
+***
+
+```{r}
+product_reorder_prob <- orders_prior_detail_eda %>% 
+  arrange(user_id, order_number, product_id) %>%
+
+  # group so that we can count user_id-product_name occurrences 
+  group_by(user_id, product_name) %>% 
+  
+  # row number is our count of the number of occurrences 
+  mutate(ordered_times = row_number()) %>%
+  
+  # ungroup for regrouping later
+  ungroup() %>% 
+
+  # now we regroup by product name and department (for plotting)
+  group_by(product_name, department) %>% 
+  
+  # get product level reorder probability = number of reorders / number of orders    
+  summarise(number_of_orders = n(),
+            number_of_reorders = sum(reordered), 
+            reorder_probability = number_of_reorders / number_of_orders)   
+
+```
+
+
+```{r}
+# get top 20 products ranked by reorder probability
+top20_reorder_prob <- product_reorder_prob %>% 
+  arrange(desc(reorder_probability)) %>% 
+  head(n=20)
+
+# get top 20 bestsellers' reorder probability
+bestseller_reorder_prob <- product_reorder_prob %>% 
+  arrange(desc(number_of_orders)) %>% 
+  head(n=20)
+
+top20_reorder_prob
+bestseller_reorder_prob
+```
+
+
+```{r fig.height=20}
+# plot top 20 products ranked by reorder probability 
+bar1 <- ggplot(top20_reorder_prob, aes(reorder(product_name,reorder_probability), reorder_probability, fill=department)) +
+    theme_minimal() +
+    geom_bar(stat = "identity")+
+    xlab("")+ ylab("") + labs(fill = "Department") + ggtitle("Top 20 Products - Ranked by Reorder Probability") +
+    geom_text(aes(label= sprintf("%1.1f%%", reorder_probability*100)), hjust=1.1, colour='white') +
+    coord_flip(ylim = c(0.5,1)) +
+    theme(panel.grid.major = element_blank(),
+          legend.position=c(0.9,0.2), 
+          # legend.title = element_text(size = 30, face="bold"),
+          # legend.text = element_text(size = 30),
+          # plot.title=element_text(size = 40, face="bold"),
+          # axis.text.y=element_text(size = 18),
+          # axis.title.y=element_text(size=10),
+          axis.text.x=element_blank(),
+          axis.title.x=element_blank(),
+          axis.ticks.x = element_blank())+
+          scale_fill_brewer(palette="Set1") +
+         scale_y_continuous(labels = scales::percent) 
+
+# plot top 20 bestsellers' reorder probability
+bar2 <- ggplot(bestseller_reorder_prob, aes(reorder(product_name,reorder_probability), reorder_probability, fill=department)) +
+    theme_minimal() +
+    geom_bar(stat = "identity")+
+    xlab("")+ ylab("Reorder Probability") + ggtitle("Top 20 Bestsellers")+
+    geom_text(aes(label= sprintf("%1.1f%%", reorder_probability*100)), hjust=1.1, colour='white') +
+    coord_flip(ylim = c(0.5,1)) +
+    theme(panel.grid.major = element_blank(),
+          legend.title = element_blank(),
+          legend.position = c(0.885,1)) + 
+          # legend.text = element_text(size = 30),
+          # plot.title=element_text(size = 40, face="bold"),
+          # axis.text.y=element_text(size = 30),
+          # axis.text.x=element_text(size = 30),
+          # axis.title.y=element_text(size=10),
+          # axis.title.x=element_text(size=30)
+    scale_fill_brewer(palette="Set2") +
+    scale_y_continuous(labels = scales::percent) 
+
+    grid.arrange(bar1, bar2,nrow=2)
+```
+
+* In this chart, we compare the reorder probability between the products with top reorder probability against our bestsellers.  
+
+* Drinks have a surprisingly high reorder rate. Out of the 20 top products by reorder probability, 9 are drinks (4 alcohol, 5 beverages)
+
+* Although the bestsellers didn't make it to the top 20 in terms of reorder probability, Most of our bestsellers have a high reorder rate.
+
+* Time to start a subscription service!
+
+### Which time of the day does each department sell the most?
+***
+```{r}
+department_hod <- orders_prior_detail_eda %>% 
+  group_by(department,order_hour_of_day) %>%
+  summarize(count = n()) %>% 
+  mutate(department_sum = sum(count),percent = 100*count/sum(count))
+
+department_hod_special <- orders_prior_detail_eda %>% 
+  filter(department == "alcohol"| department == "babies") %>% 
+  group_by(department,order_hour_of_day) %>%
+  summarize(count = n()) %>% 
+  mutate(department_sum = sum(count),percent = 100*count/sum(count))
+
+department_hod %>% 
+  ggplot() + 
+  ggtitle("Purchase Hour by Department")+
+  xlab("Order Hour of Day")+
+  ylab("Percentage")+
+  geom_line(data = department_hod,aes(x = order_hour_of_day,y=percent,group = department))+
+  geom_line(data = department_hod_special, aes(x = order_hour_of_day,y=percent,color = department),size=1)+
+  scale_color_manual(values = my_palette) +
+  my_theme+
+  theme_minimal()
+```
+
+* As compared to the other departments, alcohol sells the best in the afternoon! 
+
+* The babies department has a significant dip during lunch hours, and picks up later in the evening. Is this the time when most babies are finally asleep?
+
+### What products do users order at different hours of the day?
+***
+```{r}
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+#number of orders by products  
+order_by_hour <- orders_prior_detail_eda %>% 
+  group_by(product_name,order_hour_of_day) %>% 
+  summarise(count = n_distinct(order_id))
+
+#get statistics of each product
+products_by_order <- orders_prior_detail_eda %>% 
+  group_by(product_name) %>% 
+  summarise(totalCount = n_distinct(order_id), mean_time = mean(order_hour_of_day), mode = Mode(order_hour_of_day)) %>% 
+  filter(totalCount>360) %>% 
+  arrange(desc(totalCount)) %>% 
+  slice(1:15000)
+
+#categorize morning and afternoon products and select top 25  
+afternoon_products <- products_by_order %>%
+  filter(mean_time >12 & mean_time <23, mode >= 15 & mode<= 17) %>% 
+  arrange(desc(mean_time)) %>% 
+  slice(1:15)
+
+morning_products <- products_by_order %>%
+  filter(mean_time >0 & mean_time <12, mode>=9 & mode <= 11) %>% 
+  arrange(mean_time) %>% 
+  slice(1:15)
+
+morning_names <- morning_products %$% paste(product_name, collapse = '\n') 
+afternoon_names <- afternoon_products %$% paste(product_name, collapse = '\n')
+
+#calculate percentage of orders by products at each hour
+afternoon_products_detail <- afternoon_products %>% 
+  left_join(order_by_hour, by = "product_name") %>% 
+  mutate(pct = 100*count/totalCount) %>% 
+  arrange(desc(mean_time)) %>% 
+  select(-totalCount,-mean_time,-mode,-count) %>% 
+  mutate(hour_group = "afternoon")
+
+morning_products_detail <- morning_products %>% 
+  left_join(order_by_hour, by = "product_name") %>% 
+  mutate(pct = 100*count/totalCount) %>% 
+  arrange(mean_time) %>% 
+  select(-totalCount,-mean_time,-mode,-count) %>% 
+  mutate(hour_group = "morning")
+
+#combine the morning and afternoon tables
+products_hour_detail = rbind(afternoon_products_detail,morning_products_detail)
+
+#graphing
+products_hour_detail %>% 
+  ggplot(aes(x = order_hour_of_day, y = pct, group = product_name,colour = hour_group)) +
+  geom_line(alpha = .5)+
+  labs(x = "Hour of Day Ordered", y = "Percent of Orders by Product") +
+    theme(legend.position = 'none') +
+    scale_colour_manual(values = c("darkorange", "gray35")) +
+    theme(panel.background = element_blank()) +
+    scale_x_continuous(breaks = seq(0, 24, by = 2))+
+  annotate("text", x = 0, y = 15, label = morning_names, adj = 0, size = 2, colour = "gray35") +
+  annotate("text", x = 25, y = 15, label = afternoon_names, adj = 1, size = 2, colour = "darkorange")
+  
+```
+
+* In the morning, most of the top products that people shop are breakfast, snacks and coffee related.
+
+* During the afternoon, surprisingly, 10 out of the top 15 products purchased are ice cream products.
+
+## User-level insights
+***
+
+In the dataset provided, Instacart has `r length(unique(orders$user_id))` unique customers.
+
+### How many orders did each user place?
+***
+
+```{r}
+ord1 <- orders_prior_detail_eda %>% 
+  group_by(user_id) %>% 
+  summarize(order_number = max(order_number))
+            
+plot1 <- ggplot(ord1, aes(x = order_number)) +
+  ggtitle("Number of orders per user")+
+  xlab("")+
+  ylab("Number of users")+
+  geom_bar(fill = "orange")+
+  theme_minimal()+
+  scale_y_continuous(labels = scales::comma) 
+
+ord2 <- orders_prior_detail_eda %>% 
+  group_by(user_id) %>% 
+  summarize(order_number = max(order_number), count = n()) %>%
+  arrange(order_number) %>% 
+  mutate(pct = 100*count/sum(count), cum_pct = cumsum(pct))
+
+plot2 <- ggplot(ord2, aes(x = order_number,y = cum_pct)) +
+  xlab("Number of Orders")+
+  ylab("Cumulative Percentage")+
+  geom_line(color = "orange",stat = "identity")+
+  theme_minimal()+
+  scale_y_continuous(labels = scales::comma) 
+
+  grid.arrange(plot1, plot2, nrow=2)
+```
+
+* As explained by Instacart, the dataset contains maximum of 100 orders for each user. For any user who placed above 100 orders, she will still be classified as having only 100 orders, explaining the anomaly in the chart above at the 100th order mark in the top chart. 
+
+* Looking at the cumulative percentage, 50% of users in our dataset placed more than 25 orders, while 25% placed less than 13 orders.
+
+### How often do users place an order?
+***
+
+```{r warning=FALSE}
+order_lapse <- orders %>% 
+  group_by(days_since_prior_order) %>% 
+  summarize(count = n()) %>%
+  # remove 30 since it will distort data since all reorders above 30 days are also captured in this column 
+  filter(!days_since_prior_order == 30)
+
+ggplot(order_lapse,aes(days_since_prior_order,count))+
+  theme_minimal()+
+  xlab("Days Since Prior Order")+
+  ylab("Number of Orders")+
+  ggtitle("Days since prior order")+
+  geom_bar(stat = "identity",na.rm = TRUE,fill = "coral")+
+  scale_y_continuous(labels = scales::comma) 
+```
+
+* Interestingly, most users place an order between 7 days after their previous order. This reflects a behaviour that people usually shop on a weekly basis. 
+
+* There are also smaller peaks on days 14, 21 and 28. It could be possible that some users like to shop once every 2 or 3 weeks as well.  
+
+### Is the number of orders related to the users' shopping frequency?
+***
+
+```{r}
+orders_prior_detail_boxplot <- orders_prior_detail_eda %>% 
+  group_by(user_id) %>% 
+  summarise(shopping_frequency = mean(days_since_prior_order,na.rm = TRUE),order_number = max(order_number)) %>% 
+  mutate(order_number = as.factor(order_number)) %>% 
+  ggplot(aes(x = order_number, y = shopping_frequency)) +
+  ggtitle("Number of orders vs Shopping frequency")+
+  xlab("Number of Orders")+
+  ylab("Average Days Since Prior Order")+
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.5)+
+  scale_x_discrete(breaks = scales::pretty_breaks(10))+
+  theme_minimal()
+
+dat <- ggplot_build(orders_prior_detail_boxplot)$data[[1]]
+
+orders_prior_detail_boxplot + geom_segment(data=dat, aes(x=xmin, xend=xmax, 
+                               y=middle, yend=middle), colour="tomato", size=1.2)
+```
+
+* As seen in the chart above, The mean number of days since prior order decreases with the number of orders that a user places. Users who placed more orders tend to shop at higher frequencies, placing an order once every 4-10 days. 
+
+### Do customers place their orders at a certain time?
+***
+
+```{r fig.height=10}
+orders_dow <- orders %>% 
+  mutate(order_dow = as.factor(order_dow)) %>% 
+  group_by(order_dow) %>% 
+  summarize(count = n())
+
+time1 <- ggplot(orders_dow,aes(order_dow,count))+
+  theme_minimal()+
+  xlab("Day of Week")+
+  ylab("Number of Orders")+
+  ggtitle("Order Placed Frequency Distribution by Day of Week")+
+  geom_bar(stat = "identity", fill = "tomato")+
+  scale_y_continuous(labels = scales::comma)
+
+orders_time <- orders %>% 
+  mutate(order_hour_of_day = as.factor(order_hour_of_day)) %>% 
+  group_by(order_hour_of_day) %>% 
+  summarize(count = n()) 
+  
+time2 <- ggplot(orders_time,aes(order_hour_of_day,count))+
+  theme_minimal()+
+  xlab("Hour of Day")+
+  ylab("Number of Orders")+
+  ggtitle("Order Placed Frequency Distribution by Hour of Day")+
+  geom_bar(stat = "identity",fill = "orange")+
+  scale_y_continuous(labels = scales::comma) 
+
+grid.arrange(time1, time2, nrow=2)
+```
+
+* Customers shop the most on Sunday with a decreasing trend through the week; order number starts to pick on Friday
+
+* The number of orders increase significantly each day from 7am and peaks at 10am. There is a slight decrease during the lunch hours at 12pm, before increasing slighting at 2-3pm. People actually shop the most during working hours!  
+
+* Putting the two distributions together: 
+
+```{r}
+  ggplot(orders, aes(x = order_dow,y=order_hour_of_day))+
+  geom_bin2d(binwidth = c(1,1))+
+  ggtitle("Order Distribution by Time")+
+  xlab("Day of Week")+
+  ylab("Hour of Day")+
+  scale_fill_gradient2(low="yellow", high="tomato")+
+  theme_minimal()
+```
+
+* We can see that the most popular time to place orders is on Sunday late morning to early afternoon.
+
+
+<!-- ### How is reorder related to other variables? -->
+<!-- ```{r} -->
+<!-- p1 <- orders_prior_detail_eda %>% -->
+<!--   ggplot(aes(x = reordered, fill = reordered)) + -->
+<!--     geom_bar(alpha = 0.8) + -->
+<!--     guides(fill = FALSE)+ -->
+<!--   scale_y_continuous(labels = scales::comma) + -->
+<!--   scale_fill_manual(values = my_palette) + -->
+<!--   my_theme+ -->
+<!--   theme_minimal() -->
+
+<!-- p2 <- orders_prior_detail_eda %>% -->
+
+<!--   select(order_number,order_dow,order_hour_of_day,days_since_prior_order,add_to_cart_order, -->
+<!--          reordered) %>%  -->
+<!--   sample_n(100000) %>%  -->
+<!--   gather(x, y, order_number:add_to_cart_order) %>% -->
+<!--   ggplot(aes(x = y, y = reordered, fill = reordered)) + -->
+<!--     geom_density_ridges(alpha = 0.8, color = FALSE) + -->
+<!--     facet_wrap( ~ x, scale = "free", ncol = 3) + -->
+<!--     guides(fill = FALSE)+ -->
+<!--   scale_fill_manual(values = my_palette) + -->
+<!--   my_theme+ -->
+<!--   theme_minimal() -->
+
+<!-- grid.arrange(p1, p2, ncol = 2, widths = c(0.3, 0.7)) -->
+<!-- ``` -->
+
+
+

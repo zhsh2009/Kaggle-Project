@@ -1,0 +1,746 @@
+---
+title: "Final Project - Instacart Basket Analysis"
+author: Xinyi Zhang, Yawen Zheng, Royce Chan 
+date: October 19, 2018
+output:
+  prettydoc::html_pretty:
+    toc: true
+    smooth_scroll: true
+    collapsed: false
+    highlight: tango
+    theme: cayman
+---
+
+# Load libraries
+***
+
+```{r warning = FALSE, message=FALSE}
+library(tidyverse)
+library(DataExplorer)
+library(R.utils)
+library(gridExtra)
+library(caret)
+library(Ckmeans.1d.dp)
+library(knitr)
+library(kableExtra)
+library(ggridges)
+library(scales)
+library(gridExtra)
+```
+
+# Load data
+***
+
+```{r}
+aisles <- read.csv("data/aisles.csv")
+departments <- read.csv("data/departments.csv")
+order_products_prior <- read.csv("data/order_products__prior.csv")
+order_products_train <- read.csv("data/order_products__train.csv")
+orders <- read.csv("data/orders.csv")
+products <- read.csv("data/products.csv")
+```
+
+# Reshape data
+***
+
+## Orders table
+***
+
+* Column days_since_prior_order is NA for all first customer orders. Logically, it makes sense. We will replace all NAs with 0 - this step is essential for us to calculate the length of user relationship later.
+
+* Insert column that cumulatively sums up days_since_prior_order.
+
+```{r}
+orders <- orders %>% 
+  replace(is.na(.), 0) %>% 
+  arrange(user_id, order_number) %>% 
+  group_by(user_id) %>% 
+  mutate(days_since_first_order = cumsum(days_since_prior_order)) %>% 
+  ungroup()
+
+kable(head(orders,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+## Order products train table
+***
+
+* We will need to add user_id to this table to facilitate joining subsequently
+
+```{r}
+order_products_train$user_id <- orders$user_id[match(order_products_train$order_id, orders$order_id)]
+
+kable(head(order_products_train,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+## Products table 
+***
+
+* Firstly, we reconfigure the product table by adding a predictor variable for organic products
+
+* To keep our data frame concise, we will remove aisle and department IDs and merge the data into the products table.
+
+```{r }
+# set aisle and department names as factors 
+aisles <- aisles %>% 
+  mutate(aisle = as.factor(aisle))
+departments <- departments %>%  
+  mutate(department = as.factor(department))
+
+products_detail <- products %>% 
+  
+  # add organic predictor variable
+  mutate (prod_organic =   ifelse(str_detect(str_to_lower(products$product_name),'organic'),"1","0"), prod_organic = as.numeric(prod_organic)) %>% 
+  
+  inner_join(aisles, by = "aisle_id") %>% 
+  inner_join(departments, by = "department_id") %>% 
+  
+  # remove aisle and department ID
+  select(-aisle_id, -department_id) 
+
+kable(head(products_detail,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+## Orders prior details table
+***
+
+* In order to capture product reorder details, we need to join the tables as follow:
+
+```{r}
+prod_organic <- products_detail %>% 
+  select(c(product_id,prod_organic))
+
+orders_prior_details <- orders %>% 
+  inner_join(order_products_prior, by = "order_id")
+
+kable(head(orders_prior_details,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+# Data model
+***
+
+## Create Predictor Variables (Feature Engineering)
+***
+
+As discussed in the previous Instacart EDA section, if we were to create the data model just by using the original columns, it will be impossible to get a good prediction. The original columns will not be able to capture the complex interactions between the different categories within and between each column. As such, we will need to create our own predictor variables from existing data for the model to work effectively.
+
+We will create 3 types of predictor variables as follow:
+
+1. **Product Predictor Variables**: Characteristics of each product 
+
+2. **User Predictor Variables**: Characteristics of each user
+
+3. **User Product Predictor Variables**: Behaviour of each user towards each product
+
+These predictor variables will be merged into our final data model.
+
+### Product Predictor Variables
+***
+
+In this section, we will derive predictor variables based on characteristics of each product.
+
+1. **prod_organic**: Whether the product is organic
+
+2. **prod_average_cart_position**: Average position of product in cart
+
+3. **prod_average_dow**: Average day of week that product was bought
+
+4. **prod_average_hod**: Average hour of day that product was bought
+
+5. **prod_orders**: Total number of orders per product
+
+6. **prod_reorder_five_prob**: Probability a product is reordered five times after the first order
+
+7. **prod_reorder_ten_prob**: Probability a product is reordered ten times after the first order
+
+8. **prod_reorder_times**: In average how many times a product has been purchased by the users who purchased it at least once
+
+Looking at the variables we wish to derive, the first 5 can be easily obtained by summarising the data. The last 3 product variables will need a few interim steps.
+
+*Step 1: Create a new **prod_times** column to count the number of times a product was purchased by each user:* 
+
+```{r}
+orders_prior_details <- orders_prior_details %>% 
+  group_by(user_id,product_id) %>% 
+  arrange(user_id, product_id) %>% 
+  # prod_times counts the number of times a user has bought the product
+  mutate(prod_times = row_number()) %>% 
+  ungroup()
+
+kable(head(orders_prior_details,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+*Step 2: Derive predictor variables 2-5 and interim calculations for reorder metrics:*
+
+```{r}
+prod <- orders_prior_details %>% 
+  group_by(product_id) %>% 
+  summarise(
+    prod_average_cart_position = mean(add_to_cart_order),
+    prod_average_dow = mean(order_dow),
+    prod_average_hod = mean(order_hour_of_day),
+    
+    # number of rows = number of times product was ordered
+    prod_orders = n(),
+    
+    # number of times reordered = sum of all rows that indicate reordered = 1
+    prod_reorders = sum(reordered),
+    
+    # number of times product ordered at least once
+    prod_first_order = sum(prod_times == 1),
+    
+    # number of times product ordered at least 6x i.e. reordered 5x
+    prod_sixth_order = sum(prod_times == 6),
+    
+    # number of times product ordered at least 11x i.e. reordered 10x
+    prod_eleventh_order = sum(prod_times == 11)
+    )
+
+kable(head(prod,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+Step 3: Derive variables 6-8 and insert variable 1 that we found earlier into our final product predictor variables table:
+
+```{r}
+prod <- prod %>% 
+  mutate(
+    
+    # probability that product was reordered at least 5x
+    prod_reorder_five_prob = (prod_sixth_order / prod_first_order),
+    
+    # probability that product was reordered at least 10x
+    prod_reorder_ten_prob = (prod_eleventh_order / prod_first_order),    
+    # number of times product was reordered
+    prod_reorder_times = (1 + prod_reorders) / prod_first_order
+    ) %>% 
+  
+  # insert organic variable
+  inner_join(prod_organic, by="product_id") %>% 
+  select(-c(prod_reorders, prod_first_order, prod_sixth_order, prod_eleventh_order))
+
+kable(head(prod,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%") 
+```
+
+### User Predictor Variables
+***
+
+In this section, we will derive predictor variables based on characteristics of each user.
+
+1. **user_orders**: Total number of orders per user
+
+2. **user_period**: The time period (in days) between the first and last order of a user
+
+3. **user_mean_days_btwn_orders**: Mean time period (in days) between two consecutive orders of a user
+
+4. **user_total_products**: Total number of items that user has bought before
+
+5. **user_reorder_ratio**: Reorder ratio per user (number of times reordered / number of orders)
+
+We can derive variables 1-3 using only the information from the **orders** table, while variables 4-5 can be derived subsequently using combined data. We will also classify each user according to their respective evaluation set i.e. train / test 
+
+*Step 1: We derive variables 1-3:*
+
+```{r}
+users1 <- orders %>% 
+  
+    # keep only prior set
+    filter(eval_set=="prior") %>% 
+    group_by(user_id) %>% 
+    summarise(
+    user_orders=n(),
+  
+    # number of days between the first and last order of a user
+    user_period = max(days_since_first_order),
+  
+    # mean number of days between two consecutive orders of a user
+    user_mean_days_btwn_orders = user_period / (user_orders - 1)
+    )
+
+kable(head(users1,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+*Step 2: Derive variables 4-5 by combining both **orders** and **orders_products_prior** tables into the **orders_prior_detail** table:*
+
+```{r}
+users2 <- orders_prior_details %>%
+  group_by(user_id) %>%
+  summarise(
+    user_total_products = n(),
+    user_reorder_ratio = sum(reordered == 1) / sum(order_number > 1)
+  )
+
+kable(head(users2,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+*Step 3: The users' final orders are indicated as either **train** or **test** in the **orders** table. We will classify each user according to their respective evaluation set here:*
+
+```{r}
+# using users to identify whether evalset is train or test
+users3 <- orders %>%
+  # we keep only train and test orders
+  filter(eval_set != "prior") %>%
+  select(user_id, order_id, eval_set)
+
+kable(head(users3,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+*Step 4: Combine all 3 sub-tables from Steps 1-3 into the final **users** table:*
+
+```{r}
+users <- users1 %>% 
+  inner_join(users2, by = "user_id") %>% 
+  inner_join(users3, by = "user_id")
+
+kable(head(users,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+### User Product Predictor Variables
+***
+
+Lastly, we will create predictors for user behaviour towards each product. These should be the most important predictors, with the logical assumption that each user behaves differently towards each product, due to varying consumer preferences, phase in life etc. 
+
+*Based on our own purchase behaviour, we find that we tend to be less forgiving towards products that we do not fancy*. For example, if we stop purchasing a product after 3 orders, it should be more unlikely that we will purchase it again in our 10th order. This is largely due to the high number of substitutes available in the market. As such, we hypothesise that the variables that concern the users' last purchase of a specific product should be particularly important. 
+
+In this regard, we included variables 7 and 8, even though they are a little more difficult to derive than the rest.  
+
+1. **up_average_dow**: The average day of week that user purchased product
+
+2. **up_average_hod**: The average hour of day that user purchased product
+
+3. **up_average_cart_position**: The average position in a user's cart of the product
+
+4. **up_orders**: The total number of times a user ordered te product
+
+5. **up_last_order_number**: User's last order number that included the product
+
+6. **up_order_rate**: Percentage of users' orders that included the product
+
+7. **up_orders_since_last**: Number of orders since users' last order of the product 
+
+8. **up_days_since_last**: Number of days since user's last order of the product
+
+Variables 1-5 can be obtained easily by grouping the data by user and product IDs. The last 3 variables should need more interim steps as discussed below. 
+
+*Step 1: Find variables 1-5:*
+
+```{r}
+user_products <- orders_prior_details %>%
+  group_by(user_id, product_id) %>% 
+  summarise(
+    up_average_dow = mean(order_dow),
+    up_average_hod = mean(order_hour_of_day),
+    up_average_cart_position = mean(add_to_cart_order),
+    up_orders = n(),
+    up_last_order_number = max(order_number)
+  )
+
+kable(head(user_products,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+*Step 2: To find variables 6 **(up_order_rate)** and 7 **(up_orders_since_last)**, we will need to compare user product-specific orders against their total orders. Hence, we will join **prod** and **users** derived in the earlier section to our existing **user_products** table to proceed: *
+
+```{r}
+  user_products <- user_products %>% 
+  inner_join(prod, by = "product_id") %>% 
+  inner_join(users, by = "user_id") %>% 
+  mutate(
+    # order rate can be derived by dividing number of user product orders against total user orders
+    up_order_rate = up_orders / user_orders,
+    
+    # number of orders since last product order will be total user orders deducted by the last order of the product 
+    up_orders_since_last = user_orders - up_last_order_number
+  )
+
+kable(head(user_products,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+*Step 3: Our last variable **up_days_since_last** is derived by *total customer relationship length - (time between customer's first instacart order and last **product** purchase)*:*
+
+```{r}
+# find number of days since last product purchase
+user_products_last_order <- user_products %>% 
+  select(c(user_id, product_id, up_last_order_number, user_period)) %>% 
+  
+  # join to table that contains days_since_prior_order data
+  inner_join(orders_prior_details, by = c("user_id", "product_id")) %>% 
+  
+  # filter only orders where the last product purchase was made
+  filter(up_last_order_number == order_number) %>% 
+  
+  # number of days since last product purchase 
+  mutate(up_days_since_last = user_period - days_since_first_order)  
+
+kable(head(user_products_last_order,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+*Step 4: Insert the Variable 8 **(up_days_since_last)** into the final **user products** table:*
+
+```{r}
+user_products_days_since_last <- user_products_last_order %>% 
+  select(c(user_id, product_id, up_days_since_last))
+
+user_products <- user_products %>% 
+  inner_join(user_products_days_since_last, by=c("user_id", "product_id"))
+
+kable(head(user_products,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+### Insert train set results into final table  
+***
+
+We will need to join **order_products_train** table to the **user products** table to incorporate the results of the training set (whether product was reordered) into our final user products table:
+
+```{r}
+order_products_train1 <- order_products_train %>%  
+  select(c(user_id, product_id, reordered))
+
+# left join is used as we will need to retain testing elements in the final table 
+user_products <- user_products %>% 
+  left_join(order_products_train1, by = c("user_id", "product_id")) %>% 
+  replace(is.na(.), 0) %>% 
+  ungroup()
+
+kable(head(user_products,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+## Data modeling
+***
+
+### Split data
+***
+
+Firstly, we split the **user_products** table into their respective training and testing set, as defined by Instacart. We note that the results for the testing set are not given. Hence, the testing set should rightfully be our validation set that we submit on Kaggle. 
+
+```{r}
+train <- user_products %>% 
+  filter(eval_set=="train") %>% 
+  select(-c(eval_set,user_id)) 
+ 
+kable(head(train,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+```{r}
+validation <- user_products %>% 
+  filter(eval_set=="test") %>% 
+  select(-c(eval_set,user_id,reordered))
+
+kable(head(validation,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")       
+```
+
+Since we were not provided with a testing set, we will split our existing training set into 7:3 for training and testing respectively:
+
+```{r}
+set.seed(100)
+splitSample <- sample(x = 1:2, size = nrow(train), replace = TRUE, prob = c(.70, .30))
+#take 70% of train as train_data
+train_data <- train[splitSample==1,]
+#take 30% of train as test_data
+test_data <- train[splitSample==2,]
+```
+
+### Create model 
+***
+
+In this section, we will train 2 models on our training data: glm using the caret package and xgboost. Subsequently, we will apply both models on the testing data for comparison.   
+
+In the final part of this section, we will evaluate and compare the results from both models.
+
+#### Linear Regression
+***
+
+In this section, we will use the generalized linear model (glm). The glm is preferred over the general linear model as it addresses the scenarios where the range of Y is restricted e.g. binary and the variance of Y depends on the mean. Further, it is preferred over a simple linear model due to the dependence on potentially more than one explanatory variable.  
+
+First, we reshape the data in order for the glm model to run smoothly:
+```{r}
+train_data_log <- train_data %>% 
+  mutate(reordered = as.factor(reordered)) 
+  
+subtrain <- train_data_log %>% 
+  sample_frac(0.1) %>% 
+  select(-up_orders_since_last,-order_id, -product_id)
+```
+
+*Notes:*
+
+* *We have taken a sample of the training set to run the glm instead due to the time constraints*
+
+* *up_orders_since_last column was removed from the training data as it had very high correlation with another column, resulting in NA*
+
+##### Training model on our training data
+***
+
+```{r}
+instacart_log <- train(reordered ~ ., data = subtrain, method = "glm", family = "binomial")
+summary(instacart_log)
+```
+
+* Out of the 20 variables, 14 turned out to be significant.
+
+* The top 3 variables with the highest absolute z-value are **up_order_rate**, **up_days_since_last** and **user_reorder_ratio**. Our hypothesis seems to be aligned to the findings here, where characteristics concerning users' last order of the product might be related to whether they reorder the product in their final order. 
+
+##### Applying the model on test data
+*** 
+
+```{r}
+instacart_log_prediction_test <- predict(object = instacart_log, newdata = test_data, type = "prob") 
+
+kable(head(instacart_log_prediction_test,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+* Using the *prob* type, we derive the probability of 0 (non-reorders) and 1 (reorders) for each product order.
+
+* In the next step, we apply the probability threshold for reorder and attach the reorder column to our test data:
+
+```{r}
+test_data_log <- test_data 
+
+instacart_log_prediction_test_reordered <- instacart_log_prediction_test %>% 
+  rename(reordered_pred = "1") %>% 
+  # apply a threshold so every prediction above 0.21 will be considered as a reorder (reordered=1)
+  mutate(reordered_pred=if_else(reordered_pred>0.21,1,0)) %>% 
+  select(reordered_pred)
+
+# cbind reorder_prediction and test_data
+test_data_log_reordered <- cbind(test_data_log, instacart_log_prediction_test_reordered)
+
+kable(head(test_data_log_reordered,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+##### Confusion Matrix
+***
+
+```{r}
+test_data_log_prediction<-as.factor(test_data_log_reordered$reordered_pred)
+test_data_log_actual<-as.factor(test_data_log_reordered$reordered)
+cm_log <- confusionMatrix(test_data_log_prediction,test_data_log_actual,positive = "1")
+
+cm_log
+```
+
+* Using our glm model, we obtain a rather respectable accuracy rate of 0.8791.  
+
+* Precision (PPV) and recall (sensitivity) are rather low at 0.39517 and 0.44640 respectively. 
+
+* However, the important thing to note here is that the classes are overwhelmingly imbalanced (in our reference set, the non-reorder to reorder ratio is about 9:1). We will discuss this further in the Evaluation section. 
+
+* If we were only bothered about guessing the positive scenario (reordered=1), we would be correct about 1/9 of the time on a random guess (as referenced from the non-reorder to reorder ratio from our reference set). Hence, with the random guess probability as our baseline PCC, the estimated lift of our model is estimated to be about **0.39517 / (1/9) = 3.5563**
+
+#### XGBoost
+***
+
+The XGBoost library implements the gradient boosting decision tree algorithm. Gradient boosting uses a gradient descent algorithm to minimize the loss when adding new models.
+
+In this regard, we are using this as it is a highly flexible and versatile tool that can work through our classification problem. It should perform better than gbm in terms of speed and memory utilization.
+
+##### Training model on our training data
+***
+
+```{r message=FALSE}
+library(xgboost)
+
+train_data_xgb <- train_data
+
+params <- list(
+  "objective"           = "reg:logistic",
+  "eval_metric"         = "logloss", 
+  "eta"                 = 0.1, 
+  "max_depth"           = 6, 
+  "min_child_weight"    = 10,  
+  "gamma"               = 0.70,  
+  "subsample"           = 0.76,
+  "colsample_bytree"    = 0.95,  
+  "alpha"               = 2e-05,  
+  "lambda"              = 10,
+  "max_delta_step"      = 1
+)
+
+X <- xgb.DMatrix(as.matrix(train_data_xgb %>% select(-reordered,-order_id, -product_id)), label = train_data_xgb$reordered)
+model <- xgboost(data = X, params = params, nrounds = 80)
+```
+
+In terms of parameter tuning, we leave most of them at the default settings. The largest change is to adjust the **max_delta_step** to 1, as recommended for imbalanced class data.
+
+##### Feature Importance
+***
+
+```{r}
+importance <- xgb.importance(colnames(X), model = model)
+# We plot the importance of the predictors
+xgb.ggplot.importance(importance)
+
+kable(head(importance,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+* As predicted, the variables derived from user behaviour towards individual products turned out to be the most important. 4 out of the 8 user product predictor variables recorded the highest gain i.e. brought the greatest improvements in accuracy to the branches that they were on. 
+
+* Out of the 4 top-ranked user product predictor variables, 2 of them are about the users' last product purchase timing. This is indeed an useful observation. The user is unlikely to reorder a product that she has not purchased for a long time. 
+
+##### Applying the model on test data
+***
+
+```{r}
+test_data_xgb <- test_data
+
+X <- xgb.DMatrix(as.matrix(test_data_xgb %>% 
+                             select(-order_id, -product_id, -reordered)))
+
+test_data_xgb$reordered_pred <- predict(model, X)
+```
+
+```{r}
+# We apply a threshold so every prediction above 0.21 will be considered as a reorder (reordered=1)
+test_data_xgb <- test_data_xgb %>% 
+  mutate(reordered_pred=if_else(reordered_pred>0.21,1,0))
+
+kable(head(test_data_xgb,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+    scroll_box(width = "100%")
+```
+
+##### Confusion Matrix
+***
+
+```{r}
+#create the confusionMatrix of test_data
+test_data_xgb_prediction<-as.factor(test_data_xgb$reordered_pred)
+test_data_xgb_actual<-as.factor(test_data_xgb$reordered)
+cm_xgb <- confusionMatrix(test_data_xgb_prediction,test_data_xgb_actual,positive = "1")
+
+cm_xgb
+```
+
+* Using our xgboost model, we obtain an accuracy rate of 0.8694.  
+
+* Precision (PPV) and recall (sensitivity) are rather low at 0.37589 and 0.50885 respectively. 
+
+* If we were only bothered about guessing the positive scenario (reordered=1), we would be correct about 1/9 of the time on a random guess (as referenced from the non-reorder to reorder ratio from our reference set). Hence, with the random guess probability as our baseline PCC, the estimated lift of our model is estimated to be about **0.37589 / (1/9) = 3.38301**
+
+### Evaluate models
+***
+
+* Accuracy is often the starting point for analyzing the quality of a predictive model. If we were to evaluate both models on the accuracy metric, **we would choose the glm model with the slightly higher accuracy**.
+
+* However, due to the overwhelming class imbalance, it might be that the accuracy measure shows an excellent model performance but actually, accuracy is only reflecting the underlying class distributions. Hence, a model with a higher accuracy may have less predictive power than one that has a lower accuracy i.e. Accuracy Paradox.
+
+* Hence, in our scenario, we should evaluate **precision** (out of all the examples the classifier labeled as positive, what precentage was correct?) and **recall** (out of all the positive examples there were, what percentage did our classifier pick up?).
+
+    + glm: Precision = 0.39517, Recall = 0.44640 
+
+    + xgboost: Precision = 0.37589, Recall = 0.50885
+
+* The xgboost model outperforms the glm model significantly in Recall but lacks behind the glm model slighlly in Precision.
+
+* We use the F1 measure to evaluate the 2 models based on the balance between precision and recall. The formula for the F1 measure is given as **F1 Score = (2 x Precision x Recall) / (Precision + Recall).
+
+    + glm: F1 Score = 0.4192 
+  
+    + xgboost: F1 Score = 0.4324
+
+* **Since our xgboost model produces the higher F1 Score, we will adopt this model in our validation set.**
+
+### Apply chosen model to validation set
+***
+
+As decided above, we will apply the xgboost prediction to the validation set:
+
+```{r}
+# use the xgb.DMatrix to group our test data into a matrix
+X <- xgb.DMatrix(as.matrix(validation %>% select(-order_id, -product_id)))
+# apply the model to our validation set
+validation$reordered <- predict(model, X)
+# apply a threshold so every prediction above 0.21 will be considered as a reorder 
+validation$reordered <- (validation$reordered > 0.21) * 1
+
+# create the final table with reordered products per order
+submission <- validation %>%
+  filter(reordered == 1) %>%
+  group_by(order_id) %>%
+  summarise(
+    products = paste(product_id, collapse = " ")
+  )
+
+kable(head(submission,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+Account for the rows where no products will be ordered in our validation set:
+
+```{r message=FALSE,warning=FALSE}
+# create the table "missing" where no products will be ordered according to our prediction
+missing <- data.frame(
+  order_id = unique(validation$order_id[!validation$order_id %in% submission$order_id]),
+  products = "None"
+)
+
+# bind these rows to our submission table
+submission <- submission %>% bind_rows(missing) %>% arrange(order_id)
+
+kable(head(submission,10)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+```
+
+Lastly, we will output the csv file for submission on Kaggle:
+
+```{r}
+write.csv(submission,"submission1.csv")
+```
+
+# Discussion
+***
+
+## Main findings
+***
+
+* To gauge whether a user will reorder a product, plainly user-level and product-level features seem to be less important as compared to user behaviour towards each specific product. 
+
+    + **Possible implication:** When Instacart pushes product recommendations to users, a higher level of personalisation (on a user-product behaviour level) is required to obtain a higher reorder probability from the user e.g. recommending a product just because it is a bestseller might not trigger a reorder from the user.    
+
+* Users in general do not reorder products that they already stopped ordering a long time ago. This means that users' preferences might have changed e.g. might be buying a substitute products now, or stopped buying similar products from Instacart
+
+    + **Possible implication:** Instacart should stop pushing product recommendations for items that users have stopped purchasing after a few orders. The space can be better utilised to recommmend products in customers' recent orders. On this topic, it also deserves a deeper analysis from Instacart on whether the user is buying a similar product from Instacart, or has stopped buying similar products from Instacart entirely (which has wider implications for Instacart e.g. price analysis, competitor analysis).       
+
+## Flaws and suggestions for future studies
+***
+
+* Currently, we are estimating the probability threshold manually to determine reorders in our models. This process can be automated in the future to find the most effective threshold.
+
+* We adopted the default parameters for our xgboost and glm model in this report. If we tuned the parameters, we should be able to achieve a better prediction.
+
+* In this dataset, we are estimating the reorder probability of the products, relying heavily on users' past preferences. However, reorder probability might be linked to other factors that are not discussed here e.g. price changes, user location, new products etc.
+
+* It might be worthwhile to examine these relationships in future studies. 
+
