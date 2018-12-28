@@ -1,0 +1,1253 @@
+---
+title: "Final Project - Credit Card Fraud Detection"
+author: Ahsan Saeed, Chenyu Shen, Chi Zhang, Muhammad Waqas Aziz, Qian Li, Yawen Zheng
+date: December 12, 2018
+output:
+  prettydoc::html_pretty:
+    toc: true
+    smooth_scroll: true
+    collapsed: false
+    highlight: tango
+    theme: cayman
+---
+
+# Load libraries
+***
+
+```{r warning = FALSE, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(doParallel)
+library(tidyverse)
+library(pROC)
+library(h2o)
+library(DMwR)
+library(e1071)
+library(ROSE)
+suppressMessages(library(reshape2))
+suppressMessages(library(tidyverse))
+suppressMessages(library(DataExplorer))
+suppressMessages(library(ggplot2))
+suppressMessages(library("gridExtra"))
+library(grid)
+library(ggplot2)
+```
+
+
+# 1. INTRODUCTION
+***
+
+Financial fraud is one of the biggest challenges that the financial companies across the globe face. According to report by Nilson Report, credit card frauds resulted in losses amounting to $21.84 billion during 2015. United States accounted for 38.7% of these frauds. (Source:  Nilson Report, October 2016).
+Furthermore, on average, retailers incur $580.5 million in debit card fraud losses and spend $6.47 billion annually on credit and debit card fraud prevention annually (Source:  Payments Journal, Feb. 2012).
+
+Fraud can be defined as criminal deception with intent of acquiring financial gain. Over the last two decades, there has been an exponential increase in use of credit cards, particularly in online transactions. As a result the number of credit card frauds has also increased. Identifying fraudulent transactions among millions of transactions every day is extremely difficult. Data scientists around the globe are employing data mining techniques to predict fraudulent transactions. However, it is challenging due to two reasons. First, the profiles of fraudulent and normal behaviors change continuously and second, the fraud datasets are highly skewed (Source: Credit card fraud detection using machine learning techniques: A comparative analysis, John O. Awoyemi ; Adebayo O. Adetunmbi ; Samuel A. Oluwadare).
+
+This project investigates the performance of Gradient Boosting Machine (GBM) using H2O, Support Vector K k-nearest neighbors (KNN) and Random Forest (RF) in predicting the fraud transactions in a highly imbalanced data of credit card transactions in September 2013 by European cardholders. First, detailed Exploratory Data Analysis (EDA) was performed on the masked and PCA transformed features. Based on the insights from the EDA, three models were executed which resulted in high performance in predicting the fraud transaction in the test set. 
+
+### DATA INTRODUCTION (SOURCE:KAGGLE)
+***
+
+The dataset contains transactions made by credit cards in September 2013 by European cardholders. This dataset presents transactions that occurred in two days, where we have 492 frauds out of 284,807 transactions. The dataset is highly unbalanced, the positive class (frauds) account for 0.172% of all transactions.
+
+It contains only numerical input variables which are the result of a PCA transformation. Unfortunately, due to confidentiality issues, we cannot provide the original features and more background information about the data. Features V1, V2, ... V28 are the principal components obtained with PCA, the only features which have not been transformed with PCA are 'Time' and 'Amount'. Feature 'Time' contains the seconds elapsed between each transaction and the first transaction in the dataset. The feature 'Amount' is the transaction Amount, this feature can be used for example-dependant cost-senstive learning. Feature 'Class' is the response variable and it takes value 1 in case of fraud and 0 otherwise.
+
+
+# 2. METHODS
+***
+
+## EXPLORATORY DATA ANALYSIS (EDA)
+***
+
+#### 1. Loading Data
+***
+
+```{r message = FALSE, warning=FALSE}
+data = read_csv("creditcard.csv")
+```
+
+
+##### 1a. Checking for missing values
+***
+
+Lets see if the data has missing values
+
+```{r}
+introduce(data)
+plot_intro(data)
+```
+
+- There is only one missing value, lets see which variable has that missing value
+
+##### Determining the missing value
+***
+```{r}
+for (Var in names(data)) {
+    missing <- sum(is.na(data[,Var]))
+    if (missing > 0) {
+        print(c(Var,missing))
+    }
+}
+```
+
+- So the Time variable has one missing value. Rest of the data is complete.
+
+
+##### 1b. Checking for constant features
+***
+
+```{r}
+flag <- FALSE
+
+for (f in names(data)) {
+  if (length(unique(data[[f]])) == 1) {
+    cat(f, "\n")
+     flag <- TRUE
+  }
+}
+
+if (flag == FALSE){
+     print ("no variable found to be constant")
+}
+```
+
+
+
+##### 1c. Checking for equal columns
+***
+
+```{r}
+flag <- FALSE
+features_pair <- combn(names(data), 2, simplify = F)
+for(pair in features_pair) {
+  f1 <- pair[1]
+  f2 <- pair[2]
+  
+      if (all(data[[f1]] == data[[f2]])) {
+      cat(f1, "and", f2, "are equals.\n")
+           flag <- TRUE
+    }
+}
+
+if (flag == FALSE){
+     print ("No variables found as equal")
+}
+```
+
+
+##### 1d. Data cleansing
+***
+```{r}
+data=na.omit((data))
+```
+
+
+#### 2. Summary Statistics
+***
+First lets look at the summary statistics of all variable
+
+```{r}
+summary(data)
+```
+
+- All masked variables are already PCA transformed and therefore have a mean of 0
+
+- It will be interesting to see how these values differ across the 
+
+
+##### Factoring the Class variable
+***
+```{r}
+# Creating factor
+data <- data %>% 
+     mutate(Class = as.factor(Class)) 
+levels(data$Class) <- c('Normal', 'Fraud')
+
+#ploting
+table(data$Class)
+ggplot(data)+
+     geom_bar(aes(x = Class, fill = Class))+ggtitle("Normal vs Fraudulent Transactions")
+
+```
+
+- The data is highly unbalanced as there are 492 fraud transactions compared to 284,315 clean transactions
+
+
+#####Creating two separate data sets for Fraud and Clean transactions
+***
+```{r}
+fraudData <- subset(data,Class=='Fraud')
+notFraudData <- subset(data,Class=='Normal')
+```
+
+
+#### 3. Exploring if Fraud Transactions occur at specific time?
+***
+
+Time is defined as number of seconds elapsed between this transaction and the first transaction in the dataset
+
+```{r message = FALSE, warning=FALSE}
+# create new variable: night, based on Time variable
+data_new<-na.omit(read_csv("creditcard.csv"))
+data_new$Night <- as.factor((floor(data_new$Time/60/60)%%24 <= 9)*1)
+```
+
+
+#### Transactions divided per time of day
+***
+```{r message = FALSE, warning=FALSE}
+toPlot <- data_new
+toPlot$factClass <- as.factor(data_new$Class)
+toPlot <- table(toPlot$Night, toPlot$factClass)
+toPlot <- melt(toPlot)
+toPlot$value[toPlot$Var2==0] = toPlot$value[toPlot$Var2==0]/sum(toPlot$value[toPlot$Var2==0])
+toPlot$value[toPlot$Var2==1] = toPlot$value[toPlot$Var2==1]/sum(toPlot$value[toPlot$Var2==1])
+names(toPlot) <- c("IsNight", "Fraud", "Percentage")
+toPlot$Fraud <-as.factor(toPlot$Fraud)
+ggplot(toPlot, aes(x=Fraud, y=Percentage, fill=Fraud))+geom_bar(stat="identity")+
+  facet_grid(~IsNight)+
+  ggtitle("Division of transactions at day vs at night")+
+  scale_fill_discrete(name="Normal (0) | Fraud (1)")
+```
+
+- Fraud transactions are more likely to happen at night, comparing to normal transactions.
+
+- Normal transactions are more likely to happen during the day than during the night
+
+- Fraud transactions are more likely to happen during the day than during the night
+
+
+#### Normal and Fraud transactions variation over time
+***
+```{r message = FALSE, warning=FALSE}
+
+p1 <- ggplot(notFraudData, aes(x = Time)) +
+        geom_histogram(fill="light blue", colour = "black") + labs(title=expression("Normal Transactions"))
+
+p2 <- ggplot(fraudData, aes(x = Time)) +
+        geom_histogram(fill="light green", colour = "black") + labs(title=expression("Fraud Transactions"))
+
+p3 <- ggplot(data = data,aes(x=Time,fill=factor(Class)))+geom_density(alpha=0.5)+
+  geom_vline(aes(xintercept=mean(Time[Class=="Not Fraud"])),color="red",linetype="dashed",lwd=0.5)+
+  geom_vline(aes(xintercept=mean(Time[Class=="Fraud"])),color="blue",linetype="dashed",lwd=0.5)+ 
+       scale_x_continuous(breaks = seq(50000,100000,150000))+
+  xlab(label = "Time") +
+  ggtitle("Transaction time of Fraud and Normal transactions")+
+  theme_classic()
+
+grid.arrange(p3, p1, p2)
+```
+
+
+- We can clearly see that normal transactions follow a cyclical period. Therefore, if large number of transaction show up in low acitivity period it can raise an alarm
+
+
+
+
+#### 4. Exploring if Fraud Transactions are related with amount of transaction?
+***
+
+```{r message = FALSE, warning=FALSE}
+p3 <- ggplot(fraudData, aes(x = Amount)) +
+        geom_histogram(fill="light blue", colour = "black") + labs(title=expression("Fraud Transactions"))
+
+p4 <- ggplot(notFraudData, aes(x = Amount)) +
+        geom_histogram(fill="light green", colour = "black") + labs(title=expression("Normal Transactions"))
+
+grid.arrange(p3, p4)
+```
+
+- No particular insights here, most of the transactions appear to be of small amount for both fraud and clean transactions. Lets further look into it by looking at its percentiles
+
+#### Cumulative quintiles for Fraud and Normal transactions
+***
+```{r message = FALSE, warning=FALSE}
+##Normal Transactions
+quantile(notFraudData$Amount, seq(0, 1, by=.2))
+
+##Fraud Transactions
+quantile(fraudData$Amount, seq(0, 1, by=.2))
+```
+
+- Clearly 60% of the transactions are of amount less than ~$40. Lets zoom into the transactions under $50 to see if there is an anomaly between fraud and clean transactions 
+
+#### Cumulative % graphs for Normal and Fraud transaction amounts
+***
+```{r message = FALSE, warning=FALSE}
+tab <- melt(table(data$Amount[data$Class=='Normal']))
+tab$CummulativePercentage <- cumsum(tab$value) / sum(tab$value) # cumulative Frequency
+names(tab)[1] <- "Amount"
+p5 <- ggplot(tab[tab$Amount<50,], aes(x=Amount, y=CummulativePercentage, color=CummulativePercentage))+
+  geom_line()+ggtitle("Normal Transactions")
+
+tab <- melt(table(data$Amount[data$Class=='Fraud']))
+tab$CummulativePercentage <- cumsum(tab$value) / sum(tab$value)
+names(tab)[1] <- "Amount"
+p6 <- ggplot(tab[tab$Amount<50,], aes(x=Amount, y=CummulativePercentage, color=CummulativePercentage))+
+  geom_line()+ggtitle("Fraud Transactions")
+
+grid.arrange(p5, p6)
+```
+
+- No particular anomoly here. Based on histogram and cummulative frequency above, we can safely say that there is no anomaly based on amount of the transaction
+
+
+
+#### 5. Exploring if Fraud Transactions are related with amount and time of transaction?
+***
+
+```{r}
+
+p7<-ggplot(fraudData, aes(x=Time, y=Amount)) + 
+  geom_point(colour="light blue") + ggtitle("Fraud Transactions")
+
+p8<-ggplot(notFraudData, aes(x=Time, y=Amount)) + 
+  geom_point(colour="light green")+ggtitle("Normal Transactions")
+
+grid.arrange(p7, p8)
+```
+
+
+- Again, no particular anomaly here between fraud and normal transactions. 
+
+
+#### 6. Which variables explain the fraud transactions?
+***
+
+**We will use several methods to explore which variables can help in detecting the fraud transaction** 
+
+First,we need to look at the coorelation of all variablesto find a relation :
+
+##### Correlation map
+***
+```{r}
+plot_correlation(data, maxcat = 8L)
+```
+
+- None of the V1 to V28 PCA components have any correlation to each other. 
+- Little to no correlation between variables indicates that it is highly likely that ** data is pca transformed**
+- Time has some correlations with V components but not with Amount. 
+- Amount also has some correlations with V components but not with Time. 
+- Class has some positive and negative correlations with the V components but has no significant correlation with Time and Amount.
+
+##### Comparison of mean of variables by Fraud vs Normal transactions
+***
+```{r}
+skew <- sum(as.numeric(data$Class))/nrow(data)
+mugood <- apply(notFraudData[sample(rownames(notFraudData), size = as.integer(skew *nrow(data)), replace = T), -c(1, 30, 31)], 2, mean)
+muanom <- apply(fraudData[, -c(1, 30, 31)], 2, mean)
+plot(muanom, col = "blue", xlab = "Features", ylab = "Mean")
+lines(muanom, col = "blue", lwd = 2)
+points(mugood, col = "green")
+lines(mugood, col = "green", lwd = 2)
+legend("topright", legend = c("Normal", "Fraud"), lty = c(1,1), col = c("green", "blue"), lwd = c(2,2))
+```
+
+
+- Mean values of variables for fraud transactions are different than for normal transactions for most of the variables. 
+- Mean values for the normal transacitons dont differ.
+- Mean values for fraud transactions differ alot.
+
+**Before we go into the detail of each variable, let's look at the box plot for all the variables:**
+
+```{r}
+boxplot(data[2:29])
+```
+
+- It is worth noticing that V13, V15, V19, and maybe V24 look very symmetrical. We will look at them in detail below
+- Outliers appear to be a problem. However, outliers also help in detecting anomolies so we will not treat them. 
+Lets look at the correlation map
+
+
+##### Fraud vs Normal Transactions - deep diving into each variable 
+***
+
+We will look into each variable to compare its distribution and variance using histogram and boxplots respectively and decide on if we should include the variable in the model
+
+
+#####1. V1 
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V1, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V1, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V1 - Fraud vs Normal Transactions", ncol = 2)                                                                                
+```
+
+- The distribution of v1 for fraud vs normal transaction have some overlap
+
+- The box plot reflects that the variation is different for fraud vs normal transactions
+
+- Therefore, this variable can be **useful** in predicting fraud
+
+
+#####2. V2
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V2, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V2, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V2 - Fraud vs Normal Transactions", ncol = 2)  
+
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but very similar
+
+- Therefore, this variable **may not be useful** in predicting the fraud
+
+
+#####3. V3
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V3, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V3, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V3 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is partially similar
+
+- The variability in data has some overlap but the mean is different
+
+- Therefore, this variable is **useful** in predicting the fraud
+
+
+#####4. V4
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V4, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V4, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V4 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but very similar, however the mean are different
+
+- Therefore, this variable may be **useful** in predicting the fraud
+
+#####5. V5
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V5, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V5, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V5 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but very similar
+
+- Therefore, this variable **may not be useful** in predicting the fraud
+
+#####6. V6
+***
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V6, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V6, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V6 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and it is largely overlapping, however there is some non-overlapping area as well
+
+- The variability in data is similar
+
+- it is on the boderline, so it could be **useful** lets keep this variable
+
+
+#####7. V7
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V7, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V7, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V7 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but very similar
+
+- Therefore, this variable **may not be useful** in predicting the fraud
+
+#####8. V8
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V8, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V8, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V8 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there complete overlap
+
+- The variability in data has some overlap but very similar
+
+- Therefore, this variable **may not be useful** in predicting the fraud
+
+
+#####9. V9
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V9, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V9, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V9 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but very similar, thought they have somewhat different mean
+
+- Therefore, this variable **may be useful** in predicting the fraud
+
+#####10. V10
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V10, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V10, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V10 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but most of them are different
+
+- Therefore, this variable **may be useful** in predicting the fraud
+
+#####11. V11
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V11, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V11, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V11 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is partially different
+
+- The variability in data has some overlap but mostly different
+
+- Therefore, this variable is **useful** in predicting the fraud
+
+#####12. V12
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V12, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V12, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V12 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+- The distribution is very similar and there is a lot of overlap
+
+- The variability in data has some overlap but mostly different
+
+- Therefore, this variable may be **useful** in predicting the fraud
+
+#####13. V13
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V13, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V13, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V12 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable **may not be useful** in predicting the fraud
+
+
+#####14. V14
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V14, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V14, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V14 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is different for each class  with one distribution skewed compared to the other
+
+- There is significant variability between the Normal and Fraud transactions 
+
+- Therefore, this variable **may be useful** in predicting the fraud
+
+#####15. V15
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V15, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V15, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V15 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####16. V16
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V16, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V16, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V16 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is different for each class  with one distribution skewed compared to the other
+
+- There is significant variability between the Normal and Fraud transactions 
+
+- Therefore, this variable **may be useful** in predicting the fraud
+
+#####17. V17
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V17, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V17, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V17 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is different for each class  with one distribution skewed compared to the other
+
+- There is significant variability between the Normal and Fraud transactions 
+
+- Therefore, this variable **may be useful** in predicting the fraud
+
+#####18. V18
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V18, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V18, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V18 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is different for each class  with one distribution skewed compared to the other
+
+- There is significant variability between the Normal and Fraud transactions 
+
+- Therefore, this variable **may be useful** in predicting the fraud
+
+#####19. V19
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V19, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V19, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V19 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####20. V20
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V20, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V20, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V20 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####21. V21
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V21, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V21, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V21 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####22. V22
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V22, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V22, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V22 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####23. V23
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V23, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V23, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V23 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####24. V24
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V24, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V24, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V24 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####25. V25
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V25, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V25, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V25 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####26. V26
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V26, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V26, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V26 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####27. V27
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V27, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V27, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V27 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+#####28. V28
+***
+
+```{r message = FALSE, warning=FALSE}
+p1 <- ggplot(data, aes(x = V28, fill = Class)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity') + stat_density(geom = "line", aes(colour = Class), adjust = 10) + xlim(-20,20 ) + labs(title=expression("Distribution"))
+
+p2 <- ggplot(data, aes(y=V28, x=Class)) +  geom_boxplot(aes(fill = Class)) + labs(title=expression("Box Plot")) + xlab("Type of Transaction")
+
+grid.arrange(p1, p2, top="V28 - Fraud vs Normal Transactions", ncol = 2)
+```
+
+**Fraud vs Normal comparison**
+
+- The distribution is very similar and there is complete overlap
+
+- The variability in data is also similar
+
+- Therefore, this variable  **may not be useful** in predicting the fraud
+
+
+#####Brief Summary of V1-V28 Analysis So Far
+- Variables that have clearly seperated distribution by class: V4, V11, V12
+- Variables that have partially seperated distribution by class: V1, V2, V3, V9, V10
+- Variables that have similar mean but with different distributions by class: v5, v6, v7, v8, v14, v16, v17, v18, v19, v20, v21, v22, v23, v27, v28
+- Variables that have similar profiles by class V13, V15, V22, V25, V26
+
+
+
+## 7. Conclusion of Exploratory Data Analysis
+**Data overview**
+The dataset has around 285k values with 31 variables, out of which 1 value is missing, and all data are unique. That missing value is one missing transaction time. Three variables are original variables: Class, Time, and Amount. The rest are masked variables due to the sensitive personal information (V1 - V28)
+
+**Target Variable Analysis**
+By plotting the class by the frequency of fraud vs not fraud, we found that this is an unbalanced data with less than 0.2% of fraud transactions.
+
+**Transaction Time Analysis**
+- Transform the Time into day and night we see that most valid transactions take place during the day whereas fraud is more likely to happen than normal transactions during the night.
+- Analyze the time by class we see that the mean time for valid transaction is larger than that of fraud.
+- Normal transactions follow a cyclical period.
+- Therefore, if large number of transaction shows up in low acitivity period it can raise an alarm.
+
+**Transaction Amount Analysis**
+- Most of the transactions appear to be of small amount for both fraud and clean transactions, but fraud transactions have some outliers of large amount
+- 60% of the transactions are of amount less than ~$40
+- No particular anomaly based on amount of the transaction
+
+**Amount and Time Analysis**
+Fit the transaction amount by its time we see that there is also no particular anomoly between fraud and normal transaction. So transaction amount does not have a significant correlation with clean transaction
+
+**Blind Data Analysis**
+The correlation map shows that:
+- None of the V1 to V28 PCA components have any correlation to each other: it is highly likely that they are already transformed into principle components.
+- Time has some correlations with V components but not much with Amount. 
+- Amount also has some correlations with V components but not much with Time. 
+- Class has some positive and negative correlations with the V components but has no significant correlation with Time and Amount.
+
+Transformed components are hard to interpret based on instinct, but they are powerful variables in developing our model because selection bias is eliminated.
+Based on the individual analysis of these variables by target class, these masked variables are divided into following groups:
+a) Variables that have clearly seperated distribution by class:
+   V4, V11, V12
+  
+b) Variables that have partially seperated distribution by class:
+   V1, V2, V3, V9, V10
+
+c) Variables that have similar mean but with different distributions by class:
+   v5, v6, v7, v8, v14, v16, v17, v18, v19, v20, v21, v22, v23, v27, v28
+  
+d) Variables that have similar profiles by class
+   V13, V15, V22, V25, V26
+
+Group a,b,and c could be good predictors in the importance rank of a>b>c. Group d is relatively irrelevant to the target variable.
+
+# 3. Results and Discussion
+***
+
+## Create model 
+***
+In this section, we will train 3 models on our training data: gbm, random forest and knn. Subsequently, we will apply all three models on the testing data for comparison.
+
+
+### GBM
+***
+```{r}
+h2o.init()
+```
+
+##### Prepare Model
+***
+```{r}
+data_gbm <- h2o.importFile("creditcard.csv")
+```
+
+Create a list of predictors and change the predicted variable to factor.
+```{r}
+response <- "Class"
+data_gbm[[response]] <- as.factor(data_gbm[[response]])
+predictors <- setdiff(names(data_gbm),response)
+```
+
+Split the data into train and test using a ratio of 7:3
+```{r}
+splits <- h2o.splitFrame(
+  data = data_gbm, 
+  ratios = 0.7,   
+  seed = 1
+)
+
+train_gbm <- splits[[1]]
+test_gbm <- splits[[2]]
+```
+
+##### Training Model
+***
+```{r}
+gbm <- h2o.gbm(
+  ## standard model parameters
+  x = predictors, 
+  y = response, 
+  training_frame = train_gbm, 
+  validation_frame = test_gbm,
+  #cross validation using 5 folds
+  nfolds = 5,
+  fold_assignment = "Stratified",
+  balance_classes = TRUE,
+  distribution = "bernoulli",
+  ## more trees is better if the learning rate is small enough 
+  ## here, we want to use "more than enough" trees as we have early   ## stopping
+  ntrees = 1000,
+  ## smaller learning rate is better 
+  learn_rate=0.01,                                                         
+  ## early stopping once the validation auc doesn't improve by at least 0.01% for 5 consecutive scoring events
+  stopping_rounds = 5, stopping_tolerance = 1e-4, stopping_metric = "AUC",
+  ## sample 80% of rows per tree
+  sample_rate = 0.8,                                              
+  ## sample 80% of columns per split
+  col_sample_rate = 0.8,                                           
+  ## fix a random number generator seed for reproducibility
+  seed = 1234,                                                      
+  ## score every 10 trees to make early stopping reproducible (it depends on the scoring interval)
+  score_tree_interval = 10                                                 
+)
+```
+
+##### Model Performance & Analysis
+***
+```{r}
+gbm@model$cross_validation_metrics_summary
+h2o.confusionMatrix(gbm, valid = TRUE)
+```
+
+* The sensitity rate is about 1-27/139 = 81%, which indicates we are able to identity fraud correctly 81% of the time. We have an overall accuracy of 99.9%. 
+
+```{r}
+h2o.varimp(gbm)
+```
+
+* V14, V10 and V4 are determined to be the most important variables in the GBM model. 
+
+```{r}
+prediction = h2o.predict(gbm, newdata=test_gbm)
+head(prediction)
+pred = as.data.frame(prediction)
+perf = h2o.performance(gbm, newdata=test_gbm)
+
+h2o.auc(perf)
+```
+
+```{r}
+plot(perf, type = "roc")
+```
+
+* Conclusion: The model results in an AUC of 97.3%. The ROC graph shown above indicates we have a very good model predicting true positives. This gives us a high sensitivity which is useful in predicting fraudulent transactions.
+
+
+### Random Forest
+***
+##### Prepare Model
+***
+Data spliting: we use the same training and testing set from our first model
+```{r}
+train<- as.data.frame(train_gbm)
+levels(train$Class) <- c("NotFraud", "Fraud")
+test <- as.data.frame(test_gbm)
+levels(test$Class) <- c("NotFraud", "Fraud")
+```
+
+```{r}
+basic_rec <- recipe(Class ~ .,
+                    data = train) %>%
+     # remove variables that contain only a single value 
+     step_zv(all_predictors()) 
+```
+
+Rf grid and control
+```{r}
+ctrl <- trainControl(
+      # use 10-fold CV to resample the data
+     method = "cv",
+     #  compute probabilities for our classification model in each resample
+     classProbs = TRUE,
+     # produce ROC,AUC along with sensitivity and specificity from the default 50% cutoff
+     summaryFunction = twoClassSummary,
+     savePredictions = 'final',
+     # downsamping done instide of the resampling
+     sampling = 'down',
+     verboseIter = FALSE)
+rf_grid <- expand.grid(
+    # use the classic squre root of the observation # for number of the # of variables at each split
+    .mtry = c(6)
+            )
+```
+
+* Because there are imbalances in the class of our data, we might be facing overfitting issues to the majority class. In order to solve this, we down-sample the data to balance the number of "Fraud" and "NotFraud". 
+
+##### Training Model
+***
+```{r}
+cl <- makeCluster(8)
+registerDoParallel(cl)
+
+rf_mod <- train(basic_rec,
+                 data = train,
+                 method = 'rf',
+                 metric = "ROC",
+                 tuneGrid = rf_grid,
+                 trControl = ctrl,
+                 # set to grow 500 trees
+                 ntree = 500,
+                 verbose = FALSE,
+                importance = TRUE)
+
+stopCluster(cl)
+```
+##### Model Performance & Analysis
+***
+Variable Importance
+```{r}
+imp <- varImp(rf_mod, scale = FALSE, 
+                   surrogates = FALSE, 
+                   competes = FALSE)
+imp1 <- ggplot(imp, aes(x=reorder(rownames(imp)), y = importance)) +
+  geom_bar(stat="identity", fill="lightblue", colour="black") +
+  coord_flip() + 
+  labs(title="Prediction using RandomForest", x="Variable", y="Variable importance")
+imp1
+```
+
+* Again, similar to GBM, V10, V14 and V4 are the most important variables in the random forest model. Interestingly, time, which we believed to be important in the EDA, does not rank high in the variable importance.
+
+```{r}
+draw_confusion_matrix <- function(test, title) {
+    tst <- data.frame(test$predicted, test$Class)
+    opts <-  c("Prediction", "True")
+    names(tst) <- opts
+    cf <- plyr::count(tst)
+    cf[opts][cf[opts]==0] <- "Not Fraud"
+    cf[opts][cf[opts]==1] <- "Fraud"
+    
+    ggplot(data =  cf, mapping = aes(x = True, y = Prediction)) +
+      labs(title = "Confusion Matrix", subtitle = title) +
+      geom_tile(aes(fill = freq), colour = "black") +
+      geom_text(aes(label = sprintf("%1.0f", freq)), vjust = 1) +
+      scale_fill_gradient(low = "lightgreen", high = "green") +
+      theme_bw() + theme(legend.position = "none")}
+```
+
+```{r}
+test$predicted <- predict(rf_mod ,test)
+confusionMatrix(rf_mod)
+draw_confusion_matrix(test,"Random Forest")
+```
+
+* Based on the results, our model produces an accuracy of 0.97, and a sensitivity of 0.79. Now let's focus on sensitivity (false positives and false negatives) and look at ROC/AUC next.
+
+```{r}
+print(rf_mod)
+plot_roc <- function(x, ...) {
+  roc_obj <- roc(
+    response = x[["obs"]], 
+    predictor = x[["Fraud"]], 
+    levels = rev(levels(x$obs))
+  )
+  plot(roc_obj, ...)
+  matplot(data.frame(roc_obj$sensitivities, roc_obj$specificities), x = roc_obj$thresholds, 
+      type='l', 
+  xlab = 'threshold', ylab='TPR, TNR')
+  legend('bottomright', legend=c('TPR', 'TNR'))
+   # include the area under curve
+  return(auc(roc_obj))
+  }
+
+```
+```{r}
+plot_roc(rf_mod$pred,col = "lightblue")
+```
+
+* Conclusion: Though the model produces a great accuracy, the accuracy calculated in our model may not be as meaningful due to the imbalances in our class. We see that threshhold around 0.3 is where TPR equals TNR, and we get a good AUC of 0.982.
+
+### KNN
+***
+We believe the tree models will work great with the imbalanced data set. Just a curiosity, we predicted using a non-tree model - knn and compared the results as below.
+
+##### Prepare Model
+***
+* Due to imbalances, this time we use both downsampling and upsampling technique to get a raletively balanced data set.
+```{r}
+
+data_both <- ovun.sample(Class ~ ., data = train, method = "both", p=0.5, N=10000, seed = 123)$data
+table(data_both$Class)
+```
+As you can see, the data after sampling is much more balanced.
+
+
+```{r}
+#Run KNN Model for Data Set
+cl <- makeCluster(8)
+registerDoParallel(cl)
+control <- trainControl(method="repeatedcv", number=10, repeats=3, savePredictions=TRUE, classProbs=TRUE)
+set.seed(222)
+knn_both_mod <- train(Class~., data=data_both, trControl=control, method = "knn")
+
+stopCluster(cl)
+
+```
+
+
+
+```{r}
+#Predict Model on Test Set
+pred_both <- predict(knn_both_mod, newdata = test)
+```
+
+```{r}
+#Evaluate the Model by Looking at the ConfusionMatrix
+confusionMatrix(test$Class, pred_both, positive = "Fraud")
+```
+
+* As expected, the knn model did not do well predicting on the test set due to the highly imbalanced nature of the data set. Many data points will automatically be classified as non-fraudulent due to the large volume of non-fraudulent neightbors. Therefore, we exclude this model from our predictions on the data set, and compare only the gbm and random forest models.
+
+## Model Comparison & Conclusion
+***
+```{r}
+gbm_pred_df <- cbind(test,pred)
+
+gbm_pred_df <- gbm_pred_df %>% 
+  mutate(fraud = if_else(predict == 0, 1-p0, p0))
+
+plot(roc(rf_mod$pred$obs, rf_mod$pred$Fraud, thresholds = 0.3), col = 'blue')
+plot(roc(gbm_pred_df$Class, gbm_pred_df$fraud), add = TRUE, col = 'orange')
+```
+
+A couple observations from the model analysis and comparisons:
+* Tree models work better on imbalanced data set
+* Both GBM and random forest show great performance in predicting frauds (high sensitivity)
+* Random forest is slightly better than GBM due to a higher AUC; GBM is slightly better due to a higher sensitivity rate. As a conclusion, we recommend to use the GBM model as we want to be cautious in predicting fraudulent transactions.
+
+# 4.Conclusion
+***
+In this project we have used three machine learning models to predict fraudulent transactions on a highly imbalanced data of credit card transactions in September 2013 by European cardholders. The results were very promising for tree-based models i.e. Random Forest and Gradient Boosting (with H2O). Random forest had an AUC value of 98.2% while GBM had an AUC value of 97.3%
+
+Based on our analysis, we found that these algorithms performed better because they were able to balance the class variable effectively.  Moreover, number of features can be reduced using the Principal Component Analysis concept to improve the running time of the classification algorithm.
+
+We noted that the choosing the right balance between sensitivity, specificity and accuracy is pivotal for an imbalance data like credit card fraud logs. Usually it is desirable to have higher accuracy and sensitivity for prediction but  our rigorous data engineering revealed that for financial data like credit card fraud logs, it makes more sense to aim for higher sensitivity for accurate prediction of fraudulent transactions.  
